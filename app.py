@@ -24,6 +24,30 @@ MISP_KEY = os.getenv("MISP_KEY", "")
 MISP_TIMEOUT = float(os.getenv("MISP_TIMEOUT", "4"))
 IOC_FILE = os.getenv("IOC_FILE", "ioc.json")
 
+# Remediation pfSense (blocage IP via l'alias SOC_BLOCKLIST).
+# Cle API par variable d'environnement, jamais en dur.
+PFSENSE_URL = os.getenv("PFSENSE_URL", "https://192.168.1.24:8443")
+PFSENSE_API_KEY = os.getenv("PFSENSE_API_KEY", "")
+PFSENSE_ALIAS = os.getenv("PFSENSE_ALIAS", "SOC_BLOCKLIST")
+PFSENSE_TIMEOUT = float(os.getenv("PFSENSE_TIMEOUT", "10"))
+
+# Liste blanche: IP a ne JAMAIS bloquer, meme si le gating le decide.
+# Protection absolue contre une coupure du SOC (une erreur bloquant une
+# IP critique couperait l'infrastructure). S'applique AUSSI hors dry-run.
+BLOCK_ALLOWLIST = {
+    "192.168.1.24",   # pfSense
+    "192.168.1.98",   # Wazuh (Mac)
+    "192.168.1.107",  # MISP
+    "192.168.1.138",  # PC middleware + Ollama
+    "192.168.1.254",  # box / passerelle
+    "127.0.0.1", "::1",
+}
+# IP supplementaires a proteger, listees par l'operateur (CSV).
+for _ip in os.getenv("BLOCK_ALLOWLIST_EXTRA", "").split(","):
+    _ip = _ip.strip()
+    if _ip:
+        BLOCK_ALLOWLIST.add(_ip)
+
 
 class Verdict(BaseModel):
     severity: Literal["low", "medium", "high", "critical"]
@@ -203,16 +227,19 @@ def extract_iocs(alert: dict) -> list:
 
 
 async def check_cti(alert: dict) -> dict:
-    """Verifie la reputation des entites de l'alerte. MISP d'abord, repli statique.
+    """Verifie la reputation des entites de l'alerte via MISP ET la liste statique.
 
-    Renvoie misp_match (bool, lu par le gating), la source utilisee et la ou les
-    entites reconnues. En cas d'indisponibilite de MISP, bascule sur la liste
-    statique locale pour ne jamais bloquer la pipeline.
+    Les deux sources comptent: un match de l'une OU de l'autre suffit. MISP est
+    interroge quand une cle est configuree; qu'il reponde "pas de match" ou qu'il
+    soit injoignable, on consulte aussi la liste statique locale. misp_match (bool)
+    est lu par le gating; source indique d'ou vient le match.
     """
     iocs = extract_iocs(alert)
     if not iocs:
         return {"misp_match": False, "source": "none", "matched": []}
 
+    # 1. MISP (si configure et joignable). Un match est renvoye immediatement.
+    misp_reachable = False
     if MISP_KEY:
         try:
             headers = {"Authorization": MISP_KEY,
@@ -225,19 +252,68 @@ async def check_cti(alert: dict) -> dict:
                         headers=headers,
                         json={"value": value, "limit": 1, "to_ids": 1},
                     )
+                    misp_reachable = True
                     attrs = r.json().get("response", {}).get("Attribute", [])
                     if attrs:
                         return {"misp_match": True, "source": "misp",
                                 "matched": [value]}
-            return {"misp_match": False, "source": "misp", "matched": []}
         except (httpx.HTTPError, ValueError, KeyError):
-            pass  # MISP injoignable: on bascule sur le repli statique
+            pass  # MISP injoignable: on se rabat sur le statique ci-dessous
 
+    # 2. Liste statique locale (complement, pas seulement secours).
     for value in iocs:
         if value.lower() in STATIC_IOCS:
             return {"misp_match": True, "source": "static", "matched": [value]}
+
+    # Aucun match. On indique les sources reellement consultees.
+    sources = []
+    if misp_reachable:
+        sources.append("misp")
+    if STATIC_IOCS:
+        sources.append("static")
     return {"misp_match": False,
-            "source": "static" if STATIC_IOCS else "none", "matched": []}
+            "source": "+".join(sources) if sources else "none", "matched": []}
+
+
+async def block_ip_pfsense(ip: str, reason: str) -> dict:
+    """Bloque une IP via l'API pfSense (ajout a l'alias SOC_BLOCKLIST).
+
+    Garde-fous:
+      - liste blanche: une IP critique n'est jamais bloquee, meme hors dry-run.
+      - dry-run: en dry-run, on n'appelle pas pfSense, on renvoie l'intention.
+    Methode (API v2): GET de l'alias pour son id (non persistant, relu a chaque
+    fois), puis PATCH avec append pour ne pas ecraser les blocages existants.
+    Renvoie un dict decrivant ce qui a ete fait ou empeche.
+    """
+    if not ip:
+        return {"blocked": False, "status": "no_ip"}
+    if ip in BLOCK_ALLOWLIST:
+        return {"blocked": False, "status": "allowlisted", "ip": ip}
+    if DRY_RUN:
+        return {"blocked": False, "status": "dry_run", "ip": ip, "reason": reason}
+    if not PFSENSE_API_KEY:
+        return {"blocked": False, "status": "no_api_key", "ip": ip}
+
+    headers = {"X-API-Key": PFSENSE_API_KEY, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=PFSENSE_TIMEOUT) as client:
+            # a) relire l'id de l'alias (jamais code en dur)
+            r = await client.get(f"{PFSENSE_URL}/api/v2/firewall/aliases",
+                                 params={"name": PFSENSE_ALIAS}, headers=headers)
+            r.raise_for_status()
+            alias_id = r.json()["data"][0]["id"]
+            # b) ajouter l'IP (append pour conserver les blocages precedents)
+            r = await client.patch(
+                f"{PFSENSE_URL}/api/v2/firewall/alias",
+                headers=headers,
+                json={"id": alias_id, "address": [ip], "detail": [reason],
+                      "append": True, "apply": True},
+            )
+            r.raise_for_status()
+        return {"blocked": True, "status": "ok", "ip": ip, "reason": reason}
+    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+        return {"blocked": False, "status": "error", "ip": ip,
+                "error": f"{type(e).__name__}: {e}"}
 
 
 def log_decision(record: dict) -> None:
@@ -300,14 +376,23 @@ async def webhook(alert: dict):
     # Decision d'action: signaux verifiables uniquement, pas le verdict LLM.
     rule_level = (alert.get("rule", {}) or {}).get("level")
     decision = decide_action(rule_level, cti.get("misp_match"))
-    decision["executed"] = (
-        not DRY_RUN
-        and decision["action"] == "block_ip"
-        and not decision["requires_human"]
-    )
+
+    # Remediation: uniquement sur action block_ip. La fonction applique elle-meme
+    # la liste blanche et le dry-run, donc on l'appelle dans tous les cas pour
+    # journaliser l'intention (bloque, dry-run, liste blanche, erreur).
+    remediation = None
+    if decision["action"] == "block_ip":
+        ip = (cti.get("matched") or extract_iocs(alert) or [None])[0]
+        reason = (f"SOC - {(alert.get('rule', {}) or {}).get('description', 'alerte')}"
+                  f" - niveau {rule_level} - CTI {cti.get('source')}")
+        remediation = await block_ip_pfsense(ip, reason)
+        decision["executed"] = bool(remediation.get("blocked"))
+    else:
+        decision["executed"] = False
 
     out = {"model": MODEL, "seconds": round(time.time() - t0, 1),
            "source": source, "dry_run": DRY_RUN,
-           "result": v.model_dump(), "decision": decision}
+           "result": v.model_dump(), "decision": decision,
+           "remediation": remediation}
     log_decision({**out, "alert": alert, "cti": cti})
     return out
