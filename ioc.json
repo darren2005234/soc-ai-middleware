@@ -1,0 +1,14 @@
+{
+  "_comment": "Repli CTI statique quand MISP est indisponible. A alimenter avec des IoC connus. Les valeurs sont comparees en minuscules.",
+  "ip": [
+    "185.220.101.47",
+    "203.0.113.9",
+    "45.137.21.9"
+  ],
+  "hash": [
+    "44d88612fea8a8f36de82e1278abb02f"
+  ],
+  "domain": [
+    "malicious-example.com"
+  ]
+}
