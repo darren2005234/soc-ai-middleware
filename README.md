@@ -2,7 +2,7 @@
 
 Middleware de triage d'alertes pour un SOC souverain. Il intercepte les alertes d'un SIEM Wazuh, les enrichit via une plateforme de Threat Intelligence (MISP), les qualifie avec un LLM local (Ollama), puis décide d'une action par un gating déterministe. Aucune donnée ne sort du réseau : l'inférence est 100 % locale.
 
-Projet de fin d'études (Bac+5), spécialité Sécurité et Qualité des Réseaux.
+Projet SOC, spécialité Sécurité et Qualité des Réseaux.
 
 ## Principe
 
